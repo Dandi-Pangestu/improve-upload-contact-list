@@ -3,6 +3,8 @@
 require 'csv'
 require 'open-uri'
 require 'get_process_mem'
+require 'objspace'
+require 'benchmark'
 
 def get_usage
   GetProcessMem.new.mb

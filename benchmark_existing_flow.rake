@@ -1,6 +1,8 @@
 # frozen_string_literal: true
 
 require 'get_process_mem'
+require 'objspace'
+require 'benchmark'
 
 def get_usage
   GetProcessMem.new.mb
