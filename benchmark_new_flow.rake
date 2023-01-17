@@ -1,5 +1,7 @@
 # frozen_string_literal: true
 
+require 'csv'
+require 'open-uri'
 require 'get_process_mem'
 
 def get_usage
@@ -110,12 +112,17 @@ rescue => e
   Failure Hashie::Mash.new({ errors: { results: [{ message: 'Raise Error', row: e.as_json }] } })
 end
 
-namespace :benchmark_existing_flow do
+namespace :benchmark_new_flow do
   task create_contact: :environment do
     include Services::Elasticsearch::BulkIndex
 
     print_usage_before_and_after do
       print_time_spent do
+        phone_number_map = {}
+        headers = []
+        is_headers_fetched = false
+        extracted = []
+
         contact_list = Models::ContactList.find_by(id: 'ca8ad573-ce14-4efd-820c-38eebec92b34')
         organization = contact_list.organization
 
@@ -127,29 +134,29 @@ namespace :benchmark_existing_flow do
           integration = organization.channel_integrations.unknown.first!
         end
 
-        # url = 'https://qontak-hub-development.s3.amazonaws.com/uploads/direct/files/6a5b93e8-c47f-4f78-8847-19ca416cd07c/data.xlsx'
-        url = 'https://qontak-hub-development.s3.amazonaws.com/uploads/direct/files/7f1313bb-1bd5-4e74-8c26-c99fc4000b51/data.csv'
-        sheet = Roo::Spreadsheet.open(url)
-        header = sheet.row(1)
-        extracted = sheet
-                      .parse(headers: true)
-                      .drop(1) # Exclude headers
-                      .select { |row| row.each_value.any?(&:present?) } # Exclude empty rows
-                      .uniq { |row| row['phone_number'].to_phone rescue '' }
-                      .map! do |row|
+        csv_text = open('https://qontak-hub-development.s3.amazonaws.com/uploads/direct/files/7f1313bb-1bd5-4e74-8c26-c99fc4000b51/data.csv')
+        CSV.foreach(csv_text, headers: true) do |row|
+          headers = row.headers unless is_headers_fetched
+          row = row.to_h
           message = []
 
-          row = clean_for row, header
+          continue unless row.each_value.any?(&:present?)
+
+          phone_number_key = row['phone_number'].to_phone rescue ''
+          continue unless phone_number_map[phone_number_key].nil?
+          phone_number_map[phone_number_key] = true
+
+          row = clean_for row, headers
 
           if row.select { |k, v| v.nil? || v.blank? }.present?
             message << 'field can\'t be empty'
           end
 
-          # delete header if any whitespace
           row.delete_if { |k, v| k.nil? || k.blank? }
 
           phone_number = row['phone_number'].to_phone rescue nil
           full_name = row['full_name']
+          is_valid = false
           unless phone_number.nil?
             is_valid = phone_number.starts_with?('+') ? phone_number.phone? : "+#{phone_number}".phone?
             row.merge(phone_number: phone_number)
@@ -157,7 +164,8 @@ namespace :benchmark_existing_flow do
           end
           extra = row.except('full_name', 'phone_number')
           extra.delete('')
-          {
+
+          extracted << {
             organization:           organization,
             phone_number:           phone_number,
             full_name:              full_name,
@@ -169,8 +177,9 @@ namespace :benchmark_existing_flow do
             channel_integration_id: integration.id
           }
         end
+        csv_text.close unless csv_text.nil?
 
-        build_contacts_with_batch(extracted, organization, contact_list)
+        extracted.each_slice(100) { |item| build_contacts_with_batch(item, organization, contact_list) }
       end
     end
   end
