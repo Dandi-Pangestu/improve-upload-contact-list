@@ -1,7 +1,5 @@
 # frozen_string_literal: true
 
-require 'csv'
-require 'open-uri'
 require 'get_process_mem'
 require 'objspace'
 require 'benchmark'
@@ -67,10 +65,9 @@ def build_contacts_with_batch(contacts_attrs, organization, contact_list)
   channel_integrations = contacts_attrs.pluck(:channel_integration_id)
   account_uniq_ids = contacts_attrs.pluck(:phone_number)
 
-  # Loads here to avoid N+1 query
   contacts_map = Models::Contact
-                   .where(organization: organization, account_uniq_id: account_uniq_ids, channel_integration_id: channel_integrations)
-                   .index_by(&:account_uniq_id)
+    .where(organization: organization, account_uniq_id: account_uniq_ids, channel_integration_id: channel_integrations)
+    .index_by(&:account_uniq_id)
 
   contacts = contacts_attrs.map do |attrs|
     contact = contacts_map[attrs[:account_uniq_id]]
@@ -81,7 +78,6 @@ def build_contacts_with_batch(contacts_attrs, organization, contact_list)
       contact.is_contact = false
     else
       contact.full_name      = attrs[:full_name]
-      # contact.extra          = attrs[:extra] # -> info! Unused
       contact.error_messages = attrs[:error_messages]
       contact.is_valid       = attrs[:is_valid]
       contact.status         = attrs[:status]
@@ -89,22 +85,18 @@ def build_contacts_with_batch(contacts_attrs, organization, contact_list)
       contact.extra.delete('')
     end
 
-    # Flag Contact Extra
     contact.contact_extras.build(organization_id: organization.id, contact_list_id: contact_list.id, extra: attrs[:extra])
     contact.is_contact_extra = true
 
     contact
   end
 
-  # insert batch with activerecord import
   batch_size = (REDIS_R.get('batch_size_upload_contact') || 2_000).to_i
   import_contacts = Models::Contact.import! contacts, batch_size: batch_size, returning: [:id, :organization_id, :phone_number, :full_name, :status, :error_messages, :extra, :created_at, :updated_at, :account_uniq_id, :channel_integration_id, :deleted_at, :avatar, :is_valid, :channel, :contact_handler_id, :is_contact, :code, :authority, :is_blocked, :is_contact_extra], recursive: true, on_duplicate_key_update: [:full_name, :error_messages, :is_valid, :status, :channel, :extra, :is_contact_extra]
 
-  # bulk reindex contacts
   index_body_contacts = import_contacts.results.map { |attr| build_data_index_contact attr }
   bulk_index_raw_data(index_body_contacts, Models::Contact, refresh: true)
 
-  # insert batch contact lists contact
   build_contact_lists_contact = import_contacts.ids.map { |id| Models::ContactListsContact.new({ contact_list_id: contact_list.id, contact_id: id }) }
   Models::ContactListsContact.import! build_contact_lists_contact
 
@@ -114,17 +106,12 @@ rescue => e
   Failure Hashie::Mash.new({ errors: { results: [{ message: 'Raise Error', row: e.as_json }] } })
 end
 
-namespace :benchmark_new_flow do
+namespace :csv_excel_with_old_code do
   task create_contact: :environment do
     include Services::Elasticsearch::BulkIndex
 
     print_usage_before_and_after do
       print_time_spent do
-        phone_number_map = {}
-        headers = []
-        is_headers_fetched = false
-        extracted = []
-
         contact_list = Models::ContactList.find_by(id: 'ca8ad573-ce14-4efd-820c-38eebec92b34')
         organization = contact_list.organization
 
@@ -136,19 +123,19 @@ namespace :benchmark_new_flow do
           integration = organization.channel_integrations.unknown.first!
         end
 
-        csv_text = open('https://qontak-hub-development.s3.amazonaws.com/uploads/direct/files/7f1313bb-1bd5-4e74-8c26-c99fc4000b51/data.csv')
-        CSV.foreach(csv_text, headers: true) do |row|
-          headers = row.headers unless is_headers_fetched
-          row = row.to_h
+        # url = 'https://qontak-hub-development.s3.amazonaws.com/uploads/direct/files/6a5b93e8-c47f-4f78-8847-19ca416cd07c/data.xlsx'
+        url = 'https://qontak-hub-development.s3.amazonaws.com/uploads/direct/files/7f1313bb-1bd5-4e74-8c26-c99fc4000b51/data.csv'
+        sheet = Roo::Spreadsheet.open(url)
+        header = sheet.row(1)
+        extracted = sheet
+          .parse(headers: true)
+          .drop(1)
+          .select { |row| row.each_value.any?(&:present?) }
+          .uniq { |row| row['phone_number'].to_phone rescue '' }
+          .map! do |row|
           message = []
 
-          continue unless row.each_value.any?(&:present?)
-
-          phone_number_key = row['phone_number'].to_phone rescue ''
-          continue unless phone_number_map[phone_number_key].nil?
-          phone_number_map[phone_number_key] = true
-
-          row = clean_for row, headers
+          row = clean_for row, header
 
           if row.select { |k, v| v.nil? || v.blank? }.present?
             message << 'field can\'t be empty'
@@ -158,7 +145,6 @@ namespace :benchmark_new_flow do
 
           phone_number = row['phone_number'].to_phone rescue nil
           full_name = row['full_name']
-          is_valid = false
           unless phone_number.nil?
             is_valid = phone_number.starts_with?('+') ? phone_number.phone? : "+#{phone_number}".phone?
             row.merge(phone_number: phone_number)
@@ -166,8 +152,7 @@ namespace :benchmark_new_flow do
           end
           extra = row.except('full_name', 'phone_number')
           extra.delete('')
-
-          extracted << {
+          {
             organization:           organization,
             phone_number:           phone_number,
             full_name:              full_name,
@@ -179,9 +164,8 @@ namespace :benchmark_new_flow do
             channel_integration_id: integration.id
           }
         end
-        csv_text.close unless csv_text.nil?
 
-        extracted.each_slice(100) { |item| build_contacts_with_batch(item, organization, contact_list) }
+        build_contacts_with_batch(extracted, organization, contact_list)
       end
     end
   end
